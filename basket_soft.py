@@ -41,8 +41,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.05    # gap mínimo — igual que basket
-# Sin DIVERGENCE_MAX — acepta cualquier gap >= 5bp
+DIVERGENCE_THRESHOLD = 0.10    # gap mínimo — solo gaps de -10pts o mayores (10, 11, 12...)
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 60
@@ -59,6 +58,7 @@ CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.55    # ← CAMBIO: era 0.80, ahora 0.55
 
 ENTRY_MIN_PRICE      = 0.65
+ENTRY_MAX_PRICE      = 0.70
 
 STOP_LOSS_PRICE      = 0.33
 
@@ -476,6 +476,11 @@ def check_entry():
         bt["skipped"] += 1
         return
 
+    if entry_ask > ENTRY_MAX_PRICE:
+        log_event(f"SKIP {side} {sym} — ask={entry_ask:.4f} sobre máximo {ENTRY_MAX_PRICE}")
+        bt["skipped"] += 1
+        return
+
     shares = round(ENTRY_USD / entry_ask, 6)
     secs   = min_secs_remaining() or 0
 
@@ -713,7 +718,8 @@ def _save_log():
 async def main_loop():
     log_event("basket_soft.py iniciado — DIVERGENCIA ARMÓNICA [SOFT]")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} (sin máximo) | Consenso SOFT>={CONSENSUS_SOFT} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
+    log_event(f"div<=-{DIVERGENCE_THRESHOLD*100:.0f}pts (sin máximo) | Consenso SOFT>={CONSENSUS_SOFT} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
+    log_event(f"Precio entrada: [{ENTRY_MIN_PRICE} – {ENTRY_MAX_PRICE}]")
 
     restore_state_from_csv()
 
@@ -806,7 +812,8 @@ if __name__ == "__main__":
     log.info("=" * 54)
     log.info("  BASKET SOFT — DIVERGENCIA ARMONICA  [SOFT]")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log.info(f"  Gap: >={DIVERGENCE_THRESHOLD*100:.0f}pts (sin máximo)  |  Consenso SOFT>={CONSENSUS_SOFT}")
+    log.info(f"  Gap: <=-{DIVERGENCE_THRESHOLD*100:.0f}pts (sin máximo)  |  Consenso SOFT>={CONSENSUS_SOFT}")
+    log.info(f"  Precio entrada: [{ENTRY_MIN_PRICE} – {ENTRY_MAX_PRICE}]")
     log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  SL: {STOP_LOSS_PRICE}")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
