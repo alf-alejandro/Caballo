@@ -2,14 +2,16 @@
 basket.py — Backtesting EN VIVO de Divergencia Armónica ETH/SOL/BTC
 Lee precios REALES del order book de Polymarket — SIN ejecutar órdenes reales.
 
-CAMBIOS v6:
-  - Filtros granulares por combinación activo+lado (gap_pts y entry_mid)
-  - Basados en análisis histórico por combinación
-  - Reemplaza DIVERGENCE_THRESHOLD/MAX y ENTRY_MIN_PRICE globales
+LOGICA BINARIA CORRECTA:
+  Los tokens de Polymarket resuelven en 0 o 1 (todo o nada).
+  Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
+  Shares comprados = $1.00 / precio_ask
 
-CAMBIOS v7:
-  - ELIMINADO stop loss — trades corren hasta resolución binaria (0 o 1)
-  - sl_price = 0.0 en CSV por compatibilidad con registros históricos
+CAMBIOS v6 — SISTEMA SNIPER:
+  - ELIMINADA lógica de entrada genérica (DIVERGENCE_THRESHOLD, ENTRY_MIN_PRICE).
+  - 4 reglas de entrada con prioridad: SNIPER > MURALLA_BTC > CABALLO > UNIVERSAL.
+  - Escudo global: harm_entry >= 0.85 en todas las reglas.
+  - Campo "rule_matched" agregado al CSV para análisis por regla.
 """
 
 import asyncio
@@ -40,9 +42,10 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════
-#  PARÁMETROS GLOBALES
+#  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
+DIVERGENCE_MAX       = 0.14
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 60
@@ -58,33 +61,15 @@ RESOLVED_DN_THRESH   = 0.02
 CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
-# Sin stop loss — trades corren hasta resolución binaria
+STOP_LOSS_PRICE      = 0.33
+
+HARM_SHIELD_MIN      = 0.85   # escudo global mínimo de harm_entry
+
 MID_HISTORY_SIZE     = 3
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
-
-# ═══════════════════════════════════════════════════════
-#  FILTROS GRANULARES POR ACTIVO + LADO  (v6)
-#
-#  gap_min / gap_max  → rango de gap_pts (negativos, como viene de signal_div*100)
-#  mid_min / mid_max  → rango del precio ask de entrada
-# ═══════════════════════════════════════════════════════
-ENTRY_CONDITIONS = {
-    "SOL": {
-        "DOWN": {"gap_min": -11.23, "gap_max": -5.01, "mid_min": 0.670, "mid_max": 0.915},
-        "UP":   {"gap_min": -13.01, "gap_max": -5.00, "mid_min": 0.675, "mid_max": 0.905},
-    },
-    "BTC": {
-        "DOWN": {"gap_min": -12.95, "gap_max": -5.00, "mid_min": 0.675, "mid_max": 0.855},
-        "UP":   {"gap_min": -10.35, "gap_max": -5.50, "mid_min": 0.705, "mid_max": 0.915},
-    },
-    "ETH": {
-        "UP":   {"gap_min": -10.33, "gap_max": -5.00, "mid_min": 0.685, "mid_max": 0.885},
-        "DOWN": {"gap_min":  -9.85, "gap_max": -5.47, "mid_min": 0.795, "mid_max": 0.915},
-    },
-}
 
 # ═══════════════════════════════════════════════════════
 #  ESTADO DE LOS 3 MERCADOS
@@ -134,7 +119,7 @@ recent_events = deque(maxlen=50)
 
 CSV_COLUMNS = [
     "trade_id", "entry_ts", "exit_ts", "duration_s",
-    "asset", "side", "consensus",
+    "asset", "side", "consensus", "rule_matched",
     "entry_ask", "entry_bid", "entry_mid", "entry_usd", "shares",
     "secs_left_entry", "harm_entry", "gap_pts",
     "peer1_sym", "peer1_side_mid", "peer1_opp_mid",
@@ -386,7 +371,7 @@ async def fetch_all():
 
 
 # ═══════════════════════════════════════════════════════
-#  SEÑALES Y LÓGICA DE TRADING
+#  SEÑALES
 # ═══════════════════════════════════════════════════════
 
 def compute_signals():
@@ -447,6 +432,102 @@ def compute_signals():
             bt["consensus"] = "NONE"
 
 
+# ═══════════════════════════════════════════════════════
+#  REGLAS DE ENTRADA — SISTEMA SNIPER v6
+#  Prioridad: SNIPER > MURALLA_BTC > CABALLO > UNIVERSAL
+# ═══════════════════════════════════════════════════════
+
+def _get_entry_metrics(sym: str, side: str) -> tuple:
+    if side == "UP":
+        return markets[sym]["up_ask"], markets[sym]["up_bid"], markets[sym]["up_mid"]
+    return markets[sym]["dn_ask"], markets[sym]["dn_bid"], markets[sym]["dn_mid"]
+
+
+def _rule_sniper(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
+    """
+    Regla 1 — SNIPER: acierto histórico 100%, volumen bajo.
+    SOL (UP/DOWN), ETH (UP), BTC (UP).
+    gap_pts > -5.50  |  entry_mid > 0.88.
+    """
+    ALLOWED = {
+        "SOL": ["UP", "DOWN"],
+        "ETH": ["UP"],
+        "BTC": ["UP"],
+    }
+    if sym not in ALLOWED or side not in ALLOWED[sym]:
+        return False
+    if gap_pts <= -5.50:
+        return False
+    if entry_mid <= 0.88:
+        return False
+    return True
+
+
+def _rule_muralla_btc(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
+    """
+    Regla 4 — MURALLA BTC: acierto >94%.
+    BTC DOWN.  gap_pts > -5.50  |  entry_mid > 0.90.
+    """
+    if sym != "BTC" or side != "DOWN":
+        return False
+    if gap_pts <= -5.50:
+        return False
+    if entry_mid <= 0.90:
+        return False
+    return True
+
+
+def _rule_caballo(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
+    """
+    Regla 2 — CABALLO DE BATALLA: acierto >92%, ~100 trades/mes.
+    SOL DOWN.  gap_pts > -6.00  |  0.80 < entry_mid < 0.90  |  harm > 0.85.
+    """
+    if sym != "SOL" or side != "DOWN":
+        return False
+    if gap_pts <= -6.00:
+        return False
+    if not (0.80 < entry_mid < 0.90):
+        return False
+    if harm <= 0.85:
+        return False
+    return True
+
+
+def _rule_universal(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
+    """
+    Regla 3 — FILTRO UNIVERSAL: acierto >87%, ~500 trades/mes.
+    BTC/ETH/SOL UP y DOWN.  gap_pts > -6.00  |  entry_mid > 0.84  |  harm > 0.90.
+    """
+    if sym not in ["BTC", "ETH", "SOL"]:
+        return False
+    if gap_pts <= -6.00:
+        return False
+    if entry_mid <= 0.84:
+        return False
+    if harm <= 0.90:
+        return False
+    return True
+
+
+ENTRY_RULES = [
+    ("SNIPER",      _rule_sniper),
+    ("MURALLA_BTC", _rule_muralla_btc),
+    ("CABALLO",     _rule_caballo),
+    ("UNIVERSAL",   _rule_universal),
+]
+
+
+def match_entry_rule(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> str | None:
+    for rule_name, rule_fn in ENTRY_RULES:
+        if rule_fn(sym, side, gap_pts, entry_mid, harm):
+            return rule_name
+    return None
+
+
+# ═══════════════════════════════════════════════════════
+#  LÓGICA DE TRADING
+# ═══════════════════════════════════════════════════════
+
 def check_entry():
     if bt["traded_this_cycle"]:
         return
@@ -460,15 +541,17 @@ def check_entry():
 
     sym  = bt["signal_asset"]
     side = bt["signal_side"]
+    div_abs = abs(bt["signal_div"])
 
-    if side == "UP":
-        entry_ask = markets[sym]["up_ask"]
-        entry_bid = markets[sym]["up_bid"]
-        entry_mid = markets[sym]["up_mid"]
-    else:
-        entry_ask = markets[sym]["dn_ask"]
-        entry_bid = markets[sym]["dn_bid"]
-        entry_mid = markets[sym]["dn_mid"]
+    if div_abs > DIVERGENCE_MAX:
+        log_event(
+            f"SKIP — gap={div_abs*100:.1f}pts excede máximo {DIVERGENCE_MAX*100:.0f}pts "
+            f"(divergencia anómala, posible mercado roto)"
+        )
+        bt["skipped"] += 1
+        return
+
+    entry_ask, entry_bid, entry_mid = _get_entry_metrics(sym, side)
 
     if entry_ask <= 0 or entry_ask >= 1:
         return
@@ -481,70 +564,86 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    # ── Filtros granulares por activo + lado (v6) ──────
-    cond = ENTRY_CONDITIONS.get(sym, {}).get(side)
-    if cond is None:
-        log_event(f"SKIP {side} {sym} — combinación no definida en ENTRY_CONDITIONS")
-        bt["skipped"] += 1
-        return
+    gap_pts = bt["signal_div"] * 100     # negativo = más barato que la media armónica
+    harm    = bt["harm_up"] if side == "UP" else bt["harm_dn"]
 
-    gap_pts = bt["signal_div"] * 100
+    # ── EVALUACIÓN DE REGLAS ──────────────────────────
+    matched_rule = match_entry_rule(sym, side, gap_pts, entry_mid, harm)
 
-    if not (cond["gap_min"] <= gap_pts <= cond["gap_max"]):
+    if matched_rule is None:
         log_event(
-            f"SKIP {side} {sym} — gap={gap_pts:.2f}pts fuera de rango "
-            f"[{cond['gap_min']}, {cond['gap_max']}]"
+            f"SKIP {side} {sym} — ninguna regla activa "
+            f"(gap={gap_pts:.2f}pts mid={entry_mid:.4f} harm={harm:.4f})"
         )
         bt["skipped"] += 1
         return
 
-    if not (cond["mid_min"] <= entry_ask <= cond["mid_max"]):
+    # Escudo global de harm
+    if harm < HARM_SHIELD_MIN:
         log_event(
-            f"SKIP {side} {sym} — ask={entry_ask:.4f} fuera de rango "
-            f"[{cond['mid_min']}, {cond['mid_max']}]"
+            f"SKIP {side} {sym} [{matched_rule}] — harm={harm:.4f} "
+            f"bajo escudo mínimo {HARM_SHIELD_MIN}"
         )
         bt["skipped"] += 1
         return
 
-    # ── Todo OK — ejecutar entrada ─────────────────────
+    # ── ENTRADA ──────────────────────────────────────
     shares = round(ENTRY_USD / entry_ask, 6)
     secs   = min_secs_remaining() or 0
 
-    peers        = [s for s in SYMBOLS if s != sym]
-    peer_snaps   = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
-    harm_entry   = bt["harm_up"] if side == "UP" else bt["harm_dn"]
-    gap_entry    = bt["signal_div"]
+    peers      = [s for s in SYMBOLS if s != sym]
+    peer_snaps = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
     capital_before = bt["capital"]
 
     bt["capital"] -= ENTRY_USD
     bt["traded_this_cycle"] = True
 
     bt["position"] = {
-        "asset":         sym,
-        "side":          side,
-        "entry_price":   entry_ask,
-        "entry_bid":     entry_bid,
-        "entry_mid":     entry_mid,
-        "entry_usd":     ENTRY_USD,
-        "shares":        shares,
+        "asset":           sym,
+        "side":            side,
+        "entry_price":     entry_ask,
+        "entry_bid":       entry_bid,
+        "entry_mid":       entry_mid,
+        "entry_usd":       ENTRY_USD,
+        "shares":          shares,
         "secs_left_entry": secs,
-        "harm_entry":    harm_entry,
-        "gap_entry":     gap_entry,
-        "entry_ts":      datetime.now().isoformat(),
+        "harm_entry":      harm,
+        "gap_entry":       bt["signal_div"],
+        "entry_ts":        datetime.now().isoformat(),
         "consensus_entry": bt["consensus"],
-        "peer_snaps":    peer_snaps,
-        "capital_before": capital_before,
+        "peer_snaps":      peer_snaps,
+        "capital_before":  capital_before,
+        "rule_matched":    matched_rule,
         "market_info_snapshot": {
             "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
         },
     }
 
     log_event(
-        f"ENTRADA {side} {sym} @ ask={entry_ask:.4f} | "
-        f"gap={gap_pts:.2f}pts | arm={harm_entry:.4f} | "
+        f"ENTRADA [{matched_rule}] {side} {sym} @ ask={entry_ask:.4f} | "
+        f"gap={gap_pts:.2f}pts | harm={harm:.4f} | mid={entry_mid:.4f} | "
         f"shares={shares:.4f} | capital=${bt['capital']:.2f}"
     )
     write_state()
+
+
+def check_stop_loss():
+    pos = bt["position"]
+    if not pos:
+        return
+    sym  = pos["asset"]
+    side = pos["side"]
+    current_bid = markets[sym]["up_bid"] if side == "UP" else markets[sym]["dn_bid"]
+    if current_bid <= STOP_LOSS_PRICE and current_bid > 0:
+        pnl = round(pos["shares"] * current_bid - ENTRY_USD, 6)
+        bt["capital"]   += ENTRY_USD + pnl
+        bt["total_pnl"] += pnl
+        bt["losses"]    += 1
+        update_drawdown()
+        log_event(f"STOP LOSS {side} {sym} @ bid={current_bid:.4f} | PnL=${pnl:+.4f}")
+        _record_trade_sl(pos, current_bid, pnl)
+        bt["position"] = None
+        write_state()
 
 
 def _apply_resolution(pos, resolved):
@@ -629,6 +728,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
     p1_side_mid, p1_opp_mid = peer_mids(peers[0]) if len(peers) > 0 else (0.0, 0.0)
     p2_side_mid, p2_opp_mid = peer_mids(peers[1]) if len(peers) > 1 else (0.0, 0.0)
 
+    sl_price = STOP_LOSS_PRICE
     max_win  = round((1.0 - pos["entry_price"]) / pos["entry_price"] * pos["entry_usd"], 6)
 
     binary_win = 1 if outcome == "WIN" and exit_type == "RESOLUTION" else \
@@ -642,6 +742,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
         "asset":            pos["asset"],
         "side":             pos["side"],
         "consensus":        pos["consensus_entry"],
+        "rule_matched":     pos.get("rule_matched", "LEGACY"),
         "entry_ask":        round(pos["entry_price"], 6),
         "entry_bid":        round(pos["entry_bid"], 6),
         "entry_mid":        round(pos["entry_mid"], 6),
@@ -656,7 +757,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
         "peer2_sym":        peers[1] if len(peers) > 1 else "",
         "peer2_side_mid":   round(p2_side_mid, 6),
         "peer2_opp_mid":    round(p2_opp_mid, 6),
-        "sl_price":         0.0,   # sin stop loss — campo mantenido por compatibilidad
+        "sl_price":         sl_price,
         "exit_type":        exit_type,
         "exit_price":       round(exit_price, 6),
         "resolved":         resolved or "",
@@ -689,6 +790,13 @@ def _record_trade(pos, resolved, outcome, pnl):
     _save_log()
 
 
+def _record_trade_sl(pos, exit_bid, pnl):
+    record = _build_trade_record(pos, "STOP_LOSS", exit_bid, None, "LOSS", pnl)
+    bt["trades"].append(record)
+    _save_csv(record)
+    _save_log()
+
+
 def _save_log():
     total = bt["wins"] + bt["losses"]
     with open(LOG_FILE, "w") as f:
@@ -714,9 +822,9 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA v7 (sin stop loss, filtros granulares)")
+    log_event("basket.py iniciado — SNIPER v6 (sin Gamma)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log_event(f"Ventana entrada: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
+    log_event(f"Reglas: SNIPER | MURALLA_BTC | CABALLO | UNIVERSAL | Escudo harm>={HARM_SHIELD_MIN}")
 
     restore_state_from_csv()
 
@@ -760,7 +868,8 @@ async def main_loop():
                 secs > ENTRY_CLOSE_SECS
             )
 
-            # Sin stop loss — solo check de resolución
+            if bt["position"]:
+                check_stop_loss()
             if bt["position"]:
                 check_resolution()
 
@@ -806,9 +915,10 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v7")
+    log.info("  BASKET — SNIPER v6  [BINARIO]")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  Sin stop loss")
+    log.info(f"  Reglas: SNIPER | MURALLA_BTC | CABALLO | UNIVERSAL")
+    log.info(f"  Escudo harm >= {HARM_SHIELD_MIN}")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
