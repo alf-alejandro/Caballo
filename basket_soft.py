@@ -7,13 +7,11 @@ LOGICA BINARIA CORRECTA:
   Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
   Shares comprados = $1.00 / precio_ask
 
-CAMBIOS v6 — SISTEMA SNIPER:
-  - ELIMINADA lógica de entrada genérica (DIVERGENCE_THRESHOLD, ENTRY_MIN_PRICE).
+CAMBIOS v7 — SISTEMA SNIPER (sin UNIVERSAL):
   - 3 reglas de entrada con prioridad: SNIPER > MURALLA_BTC > CABALLO.
+  - UNIVERSAL eliminada.
   - Escudo global: harm_entry >= 0.85 en todas las reglas.
   - Campo "rule_matched" agregado al CSV para análisis por regla.
-  - entry_mid mínimo unificado en 0.80 para las 3 reglas.
-  - Filtro Universal eliminado.
 """
 
 import asyncio
@@ -65,7 +63,7 @@ CONSENSUS_SOFT       = 0.80
 
 STOP_LOSS_PRICE      = 0.33
 
-HARM_SHIELD_MIN      = 0.85
+HARM_SHIELD_MIN      = 0.85   # escudo global mínimo de harm_entry
 
 MID_HISTORY_SIZE     = 3
 
@@ -435,7 +433,7 @@ def compute_signals():
 
 
 # ═══════════════════════════════════════════════════════
-#  REGLAS DE ENTRADA — SISTEMA SNIPER v6
+#  REGLAS DE ENTRADA — SISTEMA SNIPER v7
 #  Prioridad: SNIPER > MURALLA_BTC > CABALLO
 # ═══════════════════════════════════════════════════════
 
@@ -449,7 +447,7 @@ def _rule_sniper(sym: str, side: str, gap_pts: float, entry_mid: float, harm: fl
     """
     Regla 1 — SNIPER: acierto histórico 100%, volumen bajo.
     SOL (UP/DOWN), ETH (UP), BTC (UP).
-    gap_pts > -5.50  |  entry_mid > 0.80.
+    gap_pts > -5.50  |  entry_mid > 0.88.
     """
     ALLOWED = {
         "SOL": ["UP", "DOWN"],
@@ -467,28 +465,28 @@ def _rule_sniper(sym: str, side: str, gap_pts: float, entry_mid: float, harm: fl
 
 def _rule_muralla_btc(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
     """
-    Regla 4 — MURALLA BTC: acierto >94%.
-    BTC DOWN.  gap_pts > -5.50  |  entry_mid > 0.80.
+    Regla 2 — MURALLA BTC: acierto >94%.
+    BTC DOWN.  gap_pts > -5.50  |  entry_mid > 0.90.
     """
     if sym != "BTC" or side != "DOWN":
         return False
     if gap_pts <= -5.50:
         return False
-    if entry_mid <= 0.88:
+    if entry_mid <= 0.90:
         return False
     return True
 
 
 def _rule_caballo(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
     """
-    Regla 2 — CABALLO DE BATALLA: acierto >92%, ~100 trades/mes.
-    SOL DOWN.  gap_pts > -6.00  |  entry_mid > 0.80  |  harm > 0.85.
+    Regla 3 — CABALLO DE BATALLA: acierto >92%, ~100 trades/mes.
+    SOL DOWN.  gap_pts > -6.00  |  0.80 < entry_mid < 0.90  |  harm > 0.85.
     """
     if sym != "SOL" or side != "DOWN":
         return False
     if gap_pts <= -6.00:
         return False
-    if entry_mid <= 0.80:
+    if not (0.80 < entry_mid < 0.90):
         return False
     if harm <= 0.85:
         return False
@@ -549,9 +547,10 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    gap_pts = bt["signal_div"] * 100
+    gap_pts = bt["signal_div"] * 100     # negativo = más barato que la media armónica
     harm    = bt["harm_up"] if side == "UP" else bt["harm_dn"]
 
+    # ── EVALUACIÓN DE REGLAS ──────────────────────────
     matched_rule = match_entry_rule(sym, side, gap_pts, entry_mid, harm)
 
     if matched_rule is None:
@@ -562,6 +561,7 @@ def check_entry():
         bt["skipped"] += 1
         return
 
+    # Escudo global de harm
     if harm < HARM_SHIELD_MIN:
         log_event(
             f"SKIP {side} {sym} [{matched_rule}] — harm={harm:.4f} "
@@ -570,6 +570,7 @@ def check_entry():
         bt["skipped"] += 1
         return
 
+    # ── ENTRADA ──────────────────────────────────────
     shares = round(ENTRY_USD / entry_ask, 6)
     secs   = min_secs_remaining() or 0
 
@@ -804,7 +805,7 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SNIPER v6 (sin Gamma)")
+    log_event("basket.py iniciado — SNIPER v7 (sin Gamma, sin UNIVERSAL)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log_event(f"Reglas: SNIPER | MURALLA_BTC | CABALLO | Escudo harm>={HARM_SHIELD_MIN}")
 
@@ -897,10 +898,10 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — SNIPER v6  [BINARIO]")
+    log.info("  BASKET — SNIPER v7  [BINARIO]")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log.info(f"  Reglas: SNIPER | MURALLA_BTC | CABALLO")
-    log.info(f"  Escudo harm >= {HARM_SHIELD_MIN} | entry_mid > 0.80")
+    log.info(f"  Escudo harm >= {HARM_SHIELD_MIN}")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
