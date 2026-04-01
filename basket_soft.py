@@ -7,11 +7,22 @@ LOGICA BINARIA CORRECTA:
   Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
   Shares comprados = $1.00 / precio_ask
 
-CAMBIOS v7 — SISTEMA SNIPER (sin UNIVERSAL):
-  - 3 reglas de entrada con prioridad: SNIPER > MURALLA_BTC > CABALLO.
-  - UNIVERSAL eliminada.
-  - Escudo global: harm_entry >= 0.85 en todas las reglas.
-  - Campo "rule_matched" agregado al CSV para análisis por regla.
+CAMBIOS v4:
+  - ENTRY_WINDOW_SECS = 85 (era 90) → elimina franja 85-90s que era PnL negativo
+  - DIVERGENCE_THRESHOLD = 0.05 (era 0.04) → gap mínimo 5pts
+  - DIVERGENCE_MAX = 0.14 → gap máximo 14pts, descarta divergencias anómalas
+  Resultado histórico con estos 3 filtros: WR=80%, PF=2.44, MaxDD=$2.29
+
+CAMBIOS v5:
+  - ELIMINADO Gamma API — ya no se consulta fetch_market_resolution
+  - Resolución fallback: promedio de las últimas 3 muestras CLOB del activo
+  - Si up_mid_avg > 0.5 → UP, si < 0.5 → DOWN, si == 0.5 → LOSS conservador
+  - Cero bloqueos: resolución inmediata al expirar el mercado
+
+CAMBIOS v6:
+  - DIVERGENCE_THRESHOLD = -0.04 → acepta gaps negativos (activo más barato que media)
+  - DIVERGENCE_MAX = 0.0       → descarta gaps positivos (activo más caro que media)
+  - ENTRY_MIN_PRICE = 0.70     → precio mínimo de entrada subido de 0.65 a 0.70
 """
 
 import asyncio
@@ -45,7 +56,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_MAX       = 0.14
+DIVERGENCE_THRESHOLD = -0.04   # gap mínimo (negativo): activo más barato que la media armónica
+DIVERGENCE_MAX       = 0.0     # gap máximo: descarta gaps positivos (activo más caro que media)
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 60
@@ -61,10 +73,11 @@ RESOLVED_DN_THRESH   = 0.02
 CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
+ENTRY_MIN_PRICE      = 0.70   # subido de 0.65 a 0.70
+
 STOP_LOSS_PRICE      = 0.33
 
-HARM_SHIELD_MIN      = 0.85   # escudo global mínimo de harm_entry
-
+# Cuántas muestras CLOB guardar por símbolo para el fallback
 MID_HISTORY_SIZE     = 3
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
@@ -87,6 +100,7 @@ markets = {
     for s in SYMBOLS
 }
 
+# Historial de up_mid por símbolo — usado para resolución fallback
 mid_history: dict[str, deque] = {
     s: deque(maxlen=MID_HISTORY_SIZE) for s in SYMBOLS
 }
@@ -99,7 +113,7 @@ bt = {
     "signal_div":   0.0,
     "entry_window": False,
     "position":     None,
-    "pending_resolution": None,
+    "pending_resolution": None,   # mantenido por compatibilidad, nunca se usa
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -119,7 +133,7 @@ recent_events = deque(maxlen=50)
 
 CSV_COLUMNS = [
     "trade_id", "entry_ts", "exit_ts", "duration_s",
-    "asset", "side", "consensus", "rule_matched",
+    "asset", "side", "consensus",
     "entry_ask", "entry_bid", "entry_mid", "entry_usd", "shares",
     "secs_left_entry", "harm_entry", "gap_pts",
     "peer1_sym", "peer1_side_mid", "peer1_opp_mid",
@@ -183,6 +197,15 @@ def update_drawdown():
 # ═══════════════════════════════════════════════════════
 
 def resolve_from_clob_history(sym: str) -> str:
+    """
+    Usa el promedio de las últimas MID_HISTORY_SIZE muestras de up_mid
+    para determinar el ganador cuando el mercado expira sin precio concluyente.
+
+    Regla:
+      avg > 0.5  →  UP ganó
+      avg < 0.5  →  DOWN ganó
+      avg == 0.5 →  LOSS conservador (empate técnico)
+    """
     history = list(mid_history[sym])
     if not history:
         log_event(f"FALLBACK {sym}: sin historial CLOB — asumiendo LOSS")
@@ -234,7 +257,7 @@ def write_state():
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
         "position": bt["position"],
-        "pending_resolution": None,
+        "pending_resolution": None,   # siempre None en v5
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -303,6 +326,7 @@ async def discover_all():
             if info:
                 markets[sym]["info"]  = info
                 markets[sym]["error"] = None
+                # Limpiar historial al descubrir ciclo nuevo
                 mid_history[sym].clear()
                 log_event(f"{sym}: mercado encontrado — {info.get('question','')[:50]}")
             else:
@@ -349,6 +373,7 @@ async def fetch_one(sym: str):
             markets[sym]["up_mid"] = up_mid
             markets[sym]["dn_mid"] = calc_mid(dn_metrics["best_bid"], dn_metrics["best_ask"])
 
+            # ── Acumular historial de up_mid para resolución fallback ──
             if up_mid > 0:
                 mid_history[sym].append(up_mid)
 
@@ -371,7 +396,7 @@ async def fetch_all():
 
 
 # ═══════════════════════════════════════════════════════
-#  SEÑALES
+#  SEÑALES Y LÓGICA DE TRADING
 # ═══════════════════════════════════════════════════════
 
 def compute_signals():
@@ -432,85 +457,6 @@ def compute_signals():
             bt["consensus"] = "NONE"
 
 
-# ═══════════════════════════════════════════════════════
-#  REGLAS DE ENTRADA — SISTEMA SNIPER v7
-#  Prioridad: SNIPER > MURALLA_BTC > CABALLO
-# ═══════════════════════════════════════════════════════
-
-def _get_entry_metrics(sym: str, side: str) -> tuple:
-    if side == "UP":
-        return markets[sym]["up_ask"], markets[sym]["up_bid"], markets[sym]["up_mid"]
-    return markets[sym]["dn_ask"], markets[sym]["dn_bid"], markets[sym]["dn_mid"]
-
-
-def _rule_sniper(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
-    """
-    Regla 1 — SNIPER: acierto histórico 100%, volumen bajo.
-    SOL (UP/DOWN), ETH (UP), BTC (UP).
-    gap_pts > -5.50  |  entry_mid > 0.88.
-    """
-    ALLOWED = {
-        "SOL": ["UP", "DOWN"],
-        "ETH": ["UP"],
-        "BTC": ["UP"],
-    }
-    if sym not in ALLOWED or side not in ALLOWED[sym]:
-        return False
-    if gap_pts <= -5.50:
-        return False
-    if entry_mid <= 0.88:
-        return False
-    return True
-
-
-def _rule_muralla_btc(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
-    """
-    Regla 2 — MURALLA BTC: acierto >94%.
-    BTC DOWN.  gap_pts > -5.50  |  entry_mid > 0.90.
-    """
-    if sym != "BTC" or side != "DOWN":
-        return False
-    if gap_pts <= -5.50:
-        return False
-    if entry_mid <= 0.90:
-        return False
-    return True
-
-
-def _rule_caballo(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> bool:
-    """
-    Regla 3 — CABALLO DE BATALLA: acierto >92%, ~100 trades/mes.
-    SOL DOWN.  gap_pts > -6.00  |  0.80 < entry_mid < 0.90  |  harm > 0.85.
-    """
-    if sym != "SOL" or side != "DOWN":
-        return False
-    if gap_pts <= -6.00:
-        return False
-    if not (0.80 < entry_mid < 0.90):
-        return False
-    if harm <= 0.85:
-        return False
-    return True
-
-
-ENTRY_RULES = [
-    ("SNIPER",      _rule_sniper),
-    ("MURALLA_BTC", _rule_muralla_btc),
-    ("CABALLO",     _rule_caballo),
-]
-
-
-def match_entry_rule(sym: str, side: str, gap_pts: float, entry_mid: float, harm: float) -> str | None:
-    for rule_name, rule_fn in ENTRY_RULES:
-        if rule_fn(sym, side, gap_pts, entry_mid, harm):
-            return rule_name
-    return None
-
-
-# ═══════════════════════════════════════════════════════
-#  LÓGICA DE TRADING
-# ═══════════════════════════════════════════════════════
-
 def check_entry():
     if bt["traded_this_cycle"]:
         return
@@ -522,19 +468,34 @@ def check_entry():
     if not bt["signal_asset"]:
         return
 
-    sym  = bt["signal_asset"]
-    side = bt["signal_side"]
-    div_abs = abs(bt["signal_div"])
+    div = bt["signal_div"]
 
-    if div_abs > DIVERGENCE_MAX:
+    # ── Filtro de gap v6: acepta solo divergencias negativas en [-0.04, 0.0) ──
+    if div >= DIVERGENCE_MAX:          # gap >= 0 → activo caro o a la par → SKIP
         log_event(
-            f"SKIP — gap={div_abs*100:.1f}pts excede máximo {DIVERGENCE_MAX*100:.0f}pts "
+            f"SKIP — gap={div*100:+.1f}pts ≥ 0 (activo no está descontado)"
+        )
+        bt["skipped"] += 1
+        return
+    if div < DIVERGENCE_THRESHOLD:     # gap < -4pts → descuento excesivo → SKIP
+        log_event(
+            f"SKIP — gap={div*100:+.1f}pts < {DIVERGENCE_THRESHOLD*100:.0f}pts "
             f"(divergencia anómala, posible mercado roto)"
         )
         bt["skipped"] += 1
         return
 
-    entry_ask, entry_bid, entry_mid = _get_entry_metrics(sym, side)
+    sym  = bt["signal_asset"]
+    side = bt["signal_side"]
+
+    if side == "UP":
+        entry_ask = markets[sym]["up_ask"]
+        entry_bid = markets[sym]["up_bid"]
+        entry_mid = markets[sym]["up_mid"]
+    else:
+        entry_ask = markets[sym]["dn_ask"]
+        entry_bid = markets[sym]["dn_bid"]
+        entry_mid = markets[sym]["dn_mid"]
 
     if entry_ask <= 0 or entry_ask >= 1:
         return
@@ -547,71 +508,55 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    gap_pts = bt["signal_div"] * 100     # negativo = más barato que la media armónica
-    harm    = bt["harm_up"] if side == "UP" else bt["harm_dn"]
-
-    # ── EVALUACIÓN DE REGLAS ──────────────────────────
-    matched_rule = match_entry_rule(sym, side, gap_pts, entry_mid, harm)
-
-    if matched_rule is None:
+    if entry_ask < ENTRY_MIN_PRICE:
         log_event(
-            f"SKIP {side} {sym} — ninguna regla activa "
-            f"(gap={gap_pts:.2f}pts mid={entry_mid:.4f} harm={harm:.4f})"
+            f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}"
         )
         bt["skipped"] += 1
         return
 
-    # Escudo global de harm
-    if harm < HARM_SHIELD_MIN:
-        log_event(
-            f"SKIP {side} {sym} [{matched_rule}] — harm={harm:.4f} "
-            f"bajo escudo mínimo {HARM_SHIELD_MIN}"
-        )
-        bt["skipped"] += 1
-        return
-
-    # ── ENTRADA ──────────────────────────────────────
     shares = round(ENTRY_USD / entry_ask, 6)
     secs   = min_secs_remaining() or 0
 
-    peers      = [s for s in SYMBOLS if s != sym]
-    peer_snaps = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
+    peers        = [s for s in SYMBOLS if s != sym]
+    peer_snaps   = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
+    harm_entry   = bt["harm_up"] if side == "UP" else bt["harm_dn"]
+    gap_entry    = bt["signal_div"]
     capital_before = bt["capital"]
 
     bt["capital"] -= ENTRY_USD
     bt["traded_this_cycle"] = True
 
     bt["position"] = {
-        "asset":           sym,
-        "side":            side,
-        "entry_price":     entry_ask,
-        "entry_bid":       entry_bid,
-        "entry_mid":       entry_mid,
-        "entry_usd":       ENTRY_USD,
-        "shares":          shares,
+        "asset":         sym,
+        "side":          side,
+        "entry_price":   entry_ask,
+        "entry_bid":     entry_bid,
+        "entry_mid":     entry_mid,
+        "entry_usd":     ENTRY_USD,
+        "shares":        shares,
         "secs_left_entry": secs,
-        "harm_entry":      harm,
-        "gap_entry":       bt["signal_div"],
-        "entry_ts":        datetime.now().isoformat(),
+        "harm_entry":    harm_entry,
+        "gap_entry":     gap_entry,
+        "entry_ts":      datetime.now().isoformat(),
         "consensus_entry": bt["consensus"],
-        "peer_snaps":      peer_snaps,
-        "capital_before":  capital_before,
-        "rule_matched":    matched_rule,
+        "peer_snaps":    peer_snaps,
+        "capital_before": capital_before,
         "market_info_snapshot": {
             "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
         },
     }
 
     log_event(
-        f"ENTRADA [{matched_rule}] {side} {sym} @ ask={entry_ask:.4f} | "
-        f"gap={gap_pts:.2f}pts | harm={harm:.4f} | mid={entry_mid:.4f} | "
+        f"ENTRADA {side} {sym} @ ask={entry_ask:.4f} | "
+        f"div={gap_entry*100:+.1f}pts | arm={harm_entry:.4f} | "
         f"shares={shares:.4f} | capital=${bt['capital']:.2f}"
     )
     write_state()
 
 
 def check_stop_loss():
-    pos = bt["position"]
+    pos  = bt["position"]
     if not pos:
         return
     sym  = pos["asset"]
@@ -652,6 +597,14 @@ def _apply_resolution(pos, resolved):
 
 
 def check_resolution():
+    """
+    Resolución sin Gamma.
+    Flujo:
+      1. Precio CLOB concluyente (≥0.98 / ≤0.02) → resolución inmediata.
+      2. Mercado expirado (info=None) pero sin precio concluyente →
+         fallback: promedio de las últimas MID_HISTORY_SIZE muestras de up_mid.
+      3. Si el historial está vacío → LOSS conservador + log de advertencia.
+    """
     pos = bt["position"]
     if not pos:
         return
@@ -659,6 +612,7 @@ def check_resolution():
     sym    = pos["asset"]
     up_mid = markets[sym]["up_mid"]
 
+    # 1. Precio concluyente en CLOB
     resolved = None
     if up_mid >= RESOLVED_UP_THRESH:
         resolved = "UP"
@@ -670,10 +624,12 @@ def check_resolution():
         bt["position"] = None
         return
 
+    # 2. Mercado expirado sin precio concluyente → fallback CLOB
     if markets[sym]["info"] is None:
         resolved = resolve_from_clob_history(sym)
 
         if resolved == "_UNKNOWN":
+            # Sin historial ni precio — LOSS conservador
             log_event(f"FALLBACK {sym}: resolución imposible — LOSS conservador")
             pnl = -ENTRY_USD
             bt["capital"]   += ENTRY_USD + pnl
@@ -725,7 +681,6 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
         "asset":            pos["asset"],
         "side":             pos["side"],
         "consensus":        pos["consensus_entry"],
-        "rule_matched":     pos.get("rule_matched", "LEGACY"),
         "entry_ask":        round(pos["entry_price"], 6),
         "entry_bid":        round(pos["entry_bid"], 6),
         "entry_mid":        round(pos["entry_mid"], 6),
@@ -805,9 +760,9 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SNIPER v7 (sin Gamma, sin UNIVERSAL)")
+    log_event("basket.py iniciado — SIMULACION BINARIA v6 (sin Gamma, gap negativo)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log_event(f"Reglas: SNIPER | MURALLA_BTC | CABALLO | Escudo harm>={HARM_SHIELD_MIN}")
+    log_event(f"div en [{DIVERGENCE_THRESHOLD*100:.0f}pts, 0pts) | Precio mínimo: {ENTRY_MIN_PRICE} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
 
     restore_state_from_csv()
 
@@ -847,8 +802,8 @@ async def main_loop():
             bt["entry_window"] = (
                 secs is not None and
                 secs <= ENTRY_WINDOW_SECS and
-                secs >= ENTRY_OPEN_SECS and
-                secs > ENTRY_CLOSE_SECS
+                secs >= ENTRY_OPEN_SECS
+                and secs > ENTRY_CLOSE_SECS
             )
 
             if bt["position"]:
@@ -898,10 +853,9 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — SNIPER v7  [BINARIO]")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v6")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log.info(f"  Reglas: SNIPER | MURALLA_BTC | CABALLO")
-    log.info(f"  Escudo harm >= {HARM_SHIELD_MIN}")
+    log.info(f"  Gap: [{DIVERGENCE_THRESHOLD*100:.0f}pts, 0pts)  |  Precio mín: {ENTRY_MIN_PRICE}  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
